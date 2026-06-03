@@ -4,6 +4,11 @@ This directory is written by the `vibeue-self-improve` Claude Code skill. Every
 time the agent hits a "no suitable tool" gap during a VibeUE task and runs the
 pipeline, it appends a record to `gap-log.md`.
 
+> The skill itself is a versioned snapshot here: `vibeue-self-improve.SKILL.md`.
+> The **canonical, live** copy lives at user level
+> (`~/.claude/skills/vibeue-self-improve/SKILL.md`) — that is the one Claude Code
+> actually loads. Keep this snapshot in sync when the skill changes.
+
 ## Gap record format
 
 Each record is one section appended to `gap-log.md`:
