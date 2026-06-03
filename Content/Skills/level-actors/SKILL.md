@@ -391,3 +391,26 @@ unreal.ActorService.set_absolute_transform("MyCube", False, True, False)
 loc, rot, scale = unreal.ActorService.get_absolute_transform("MyCube")
 print(f"Absolute: loc={loc}, rot={rot}, scale={scale}")
 ```
+
+---
+
+### Per-Level World Settings (`AWorldSettings`: KillZ, gravity, etc.)
+
+> ⚠️ World Settings is **per-level state on the hidden `AWorldSettings` actor** — NOT a `UDeveloperSettings` config object. `EngineSettingsService`/`ProjectSettingsService` and their "Physics (gravity)" categories edit the *project-wide* `DefaultGravityZ`; they do **not** touch this level's `KillZ` or `GlobalGravityZ`. There is also no `ActorService` method for it (the actor has no outliner name to look up by). Reach it through the editor world instead.
+
+```python
+import unreal
+
+world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+ws = world.get_world_settings()   # the level's AWorldSettings (may be a subclass, e.g. LyraWorldSettings)
+
+# Read
+print(ws.get_editor_property("kill_z"))            # actors falling below this Z get destroyed
+
+# Write (per-level overrides)
+ws.set_editor_property("kill_z", -50000.0)
+ws.set_editor_property("global_gravity_set", True) # required for the level gravity override to apply
+ws.set_editor_property("global_gravity_z", -490.0) # half gravity for this level only
+```
+
+Other useful `AWorldSettings` editor properties: `kill_z_damage_type`, `world_to_meters`, `default_game_mode`, `time dilation` min/max fields. Changes are immediate in the editor world; **save the level** (not a config file) to persist them.
