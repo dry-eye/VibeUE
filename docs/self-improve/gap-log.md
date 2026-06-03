@@ -16,3 +16,15 @@ Append-only. Format defined in `README.md`.
 - **Commit:** 0000000
 
 ---
+
+## GAP-20260603-1: read/set per-level World Settings (KillZ)
+- **Date:** 2026-06-03
+- **Intent:** Read and set `KillZ` on the current level's World Settings (`AWorldSettings`), restoring the original after verification.
+- **Searched:** manage_skills(list) — no "world-settings" skill; only engine-settings / project-settings (UDeveloperSettings, project-wide) and level-actors (ActorService). manage_skills(suggest "world settings killz gravity") → engine-settings / project-settings, neither targets AWorldSettings. discover_python_function(unreal.GameplayStatics.get_world_settings) → NOT_FOUND; discover_python_function(unreal.ActorService.get_world_settings) → NOT_FOUND. discover_python_class(EngineSettingsService/ProjectSettingsService/ActorService, filter "world") → no world-settings method.
+- **Why no tool:** World Settings is per-level state on the hidden `AWorldSettings` actor, not a UDeveloperSettings config object; the engine/project settings services edit project-wide `DefaultGravityZ`, not this level's `KillZ`/`GlobalGravityZ`. ActorService only exposes generic get/set_property keyed by actor name, and AWorldSettings has no outliner name.
+- **Tier:** skill
+- **Artifact:** Content/Skills/level-actors/SKILL.md (added "Per-Level World Settings (`AWorldSettings`: KillZ, gravity, etc.)" section)
+- **Verified:** Live in UE 5.7.4 editor (map GASModular_Example). `world.get_world_settings()` returned the level's `LyraWorldSettings` (isinstance unreal.WorldSettings == True). ORIGINAL kill_z = -1048575.0; after set -54321.0; clean re-run with fresh world/ws lookup read back -54321.0; restored to -1048575.0 (confirmed via fresh lookup). Level NOT saved.
+- **Commit:** 086162b
+
+---
