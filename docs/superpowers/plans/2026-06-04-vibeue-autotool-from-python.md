@@ -27,14 +27,20 @@
 | `docs/self-improve/tool-candidates/_SCHEMA.md` (fork) | Candidate-record + swap-manifest schema | create |
 | `docs/self-improve/tool-candidates/` (fork) | One file per pending candidate | create (dir) |
 | `docs/self-improve/templates/simple-wrapper.cpp.tmpl` (fork) | Canonical generated-tool template | create |
-| `Scripts/SelfImprove/Build-ShadowTool.ps1` (fork) | Make/refresh shadow worktree, write tool .cpp, run BuildPlugin, parse result, stage-or-discard | create |
-| `Scripts/SelfImprove/Apply-PendingSwap.ps1` (fork) | At session start: apply staged binary+source to live checkout, clear queue | create |
+| `Scripts/SelfImprove/Build-PendingTool.ps1` (fork) | Build ONE pending candidate in place (`Build.bat <target> Win64 <config>`), parse `Result: Succeeded`; GREEN keep, RED `git checkout` the .cpp + rebuild prior good | create |
+| `Scripts/SelfImprove/Apply-PendingBuild.ps1` (fork) | Session-start launcher: guard editor-closed → loop pending-build markers via Build-PendingTool → commit green → launch editor | create |
 | `docs/self-improve/gap-log.md` (fork) | Extended with auto-cycle outcome fields | modify |
 | `project_vibeue_self_improve_pipeline.md` (memory) | Record §8 approval-gate carve-out | modify |
 
-**Out-of-repo runtime paths** (gitignored / siblings, decided here so tasks agree):
-- Shadow worktree: `M:\UnrealProjects\VibeUE-shadow` (sibling of `Game`, so the editor never scans it).
-- Pending-swap staging: `M:\UnrealProjects\Game\Saved\SelfImprove\pending-swap\` (`Saved/` is gitignored).
+> **Model revised 2026-06-04 (Task 3):** isolation switched from shadow-build+swap to
+> **in-place build + auto-rollback** (see spec §6). No shadow worktree, no staged
+> binary. The generated `.cpp` goes straight into the live tree; the build happens at
+> the next editor-closed window; red rolls back via `git checkout`.
+
+**Out-of-repo runtime paths** (gitignored, decided here so tasks agree):
+- Generated tool sources: `Source/VibeUE/Private/Tools/Generated/` (in the live tree, tracked).
+- Pending-build markers: `M:\UnrealProjects\Game\Saved\SelfImprove\pending-build\` (`Saved/` is gitignored).
+- Build: `Build.bat GameEditor Win64 DebugGame "M:\UnrealProjects\Game\Game.uproject" -waitmutex` (target/config confirmed live in Task 3); success marker `Result: Succeeded`; capture stdout (no fixed log file).
 
 ---
 
@@ -198,161 +204,169 @@ Record: the exact success string (e.g. `BUILD SUCCESSFUL` / `Result: Succeeded`)
 
 ---
 
-## Task 4: `Build-ShadowTool.ps1` — shadow worktree, build, gate, stage
+## Task 4: `Build-PendingTool.ps1` — in-place build of one candidate + green/red + rollback
 
 **Files:**
-- Create: `Scripts/SelfImprove/Build-ShadowTool.ps1`
+- Create: `Scripts/SelfImprove/Build-PendingTool.ps1`
 
-Behavior: given a candidate id + a generated `.cpp` path (in the live tree's `Source/VibeUE/Private/Tools/Generated/`), it (1) creates/refreshes a git worktree of the fork at the shadow root, (2) ensures the generated `.cpp` is present there, (3) runs the build command from Task 3, (4) parses the success marker, (5) green → stage binary + write swap manifest; red → delete the generated `.cpp` from the live tree and write a red record.
+Behavior (in-place model, spec §6): given a generated `.cpp` already present in the live tree, **with the editor closed**, rebuild the editor target in the live config and parse UBT `Result: Succeeded`. **GREEN** → the freshly built DLL is now live; print `GREEN`. **RED** → `git checkout`/remove the bad `.cpp`, **rebuild the prior good state** so the editor can still launch, print `RED`. This script does NOT commit (the launcher in Task 5 commits green sources).
+
+> **Testability constraint (important):** a real build requires the editor CLOSED, but this MCP session runs *inside* the live editor. So the green/red build itself **cannot be exercised mid-session** — only the editor-running guard and script parse can be tested now. The real green/red/rollback verification is deferred to **Task 9** (manual, editor-closed). The script therefore exposes a `-BuildResultOverride` test seam used ONLY by tests to bypass the real build.
 
 - [ ] **Step 1: Write the script**
 
-Create `Scripts/SelfImprove/Build-ShadowTool.ps1`:
+Create `Scripts/SelfImprove/Build-PendingTool.ps1`:
 
 ```powershell
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string]$CandidateId,
-    [Parameter(Mandatory)] [string]$GeneratedCpp,   # path RELATIVE to plugin root
-    [string]$PluginRoot = 'M:\UnrealProjects\Game\Plugins\VibeUE',
-    [string]$ShadowRoot = 'M:\UnrealProjects\VibeUE-shadow',
-    [string]$StageDir   = 'M:\UnrealProjects\Game\Saved\SelfImprove\pending-swap'
+    [Parameter(Mandatory)] [string]$GeneratedCpp,   # relative to plugin root, in the live tree
+    [string]$CandidateId   = '',
+    [string]$PluginRoot    = 'M:\UnrealProjects\Game\Plugins\VibeUE',
+    [string]$ProjectFile   = 'M:\UnrealProjects\Game\Game.uproject',
+    [string]$BuildTarget   = 'GameEditor',
+    [string]$BuildConfig   = 'DebugGame',
+    [string]$EnginePath    = 'M:\UnrealEngines\UE_5.7',
+    [ValidateSet('', 'GREEN', 'RED')] [string]$BuildResultOverride = ''  # TEST SEAM ONLY
 )
 $ErrorActionPreference = 'Stop'
+$BuildBat = Join-Path $EnginePath 'Engine\Build\BatchFiles\Build.bat'
+$Marker   = 'Result: Succeeded'
 
-# --- Build command + success marker: SET FROM TASK 3 FINDINGS ---
-$SuccessMarker = 'Result: Succeeded'   # <-- replace with the exact string Task 3 recorded
-function Invoke-ShadowBuild { param($Root)
-    & "$Root\BuildPlugin.bat"          # <-- replace with the standalone UAT call if Task 3 said so
-    return $LASTEXITCODE
+function Invoke-EditorBuild {
+    if ($BuildResultOverride) { return ($BuildResultOverride -eq 'GREEN') }  # test bypass
+    $out = & $BuildBat $BuildTarget Win64 $BuildConfig "$ProjectFile" -waitmutex | Out-String
+    return ($out -match [regex]::Escape($Marker))
 }
 
-# 1. Make/refresh the shadow worktree of the CURRENT branch.
-$branch = (& git -C $PluginRoot rev-parse --abbrev-ref HEAD).Trim()
-if (-not (Test-Path $ShadowRoot)) {
-    & git -C $PluginRoot worktree add $ShadowRoot $branch
-} else {
-    & git -C $ShadowRoot checkout $branch
-    & git -C $ShadowRoot reset --hard $branch
+# Guard: editor must be closed (it locks the DLL we are about to rebuild).
+# Skipped under the test seam so the rollback logic can be exercised without a real build.
+if (-not $BuildResultOverride -and (Get-Process -Name 'UnrealEditor*' -ErrorAction SilentlyContinue)) {
+    throw 'UnrealEditor is running; close it before building (it locks the plugin DLL).'
 }
 
-# 2. Copy the generated .cpp into the shadow tree (it lives in the live tree pre-build).
-$src = Join-Path $PluginRoot $GeneratedCpp
-$dst = Join-Path $ShadowRoot $GeneratedCpp
-New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-Copy-Item $src $dst -Force
-
-# 3. Build the shadow tree.
-$exit = Invoke-ShadowBuild -Root $ShadowRoot
-$log  = Get-Content "$ShadowRoot\Saved\Logs\BuildPlugin.log" -Raw -ErrorAction SilentlyContinue
-$green = ($log -and $log.Contains($SuccessMarker))
-
-# 4. Gate.
-New-Item -ItemType Directory -Force $StageDir | Out-Null
-if ($green) {
-    $manifest = [pscustomobject]@{
-        id = $CandidateId; tool_name = $CandidateId
-        source_files = @($GeneratedCpp); binary_dir = 'Binaries\Win64'
-        shadow_root = $ShadowRoot; build_result = 'Succeeded'
-    }
-    $manifest | ConvertTo-Json | Set-Content "$StageDir\$CandidateId.json" -Encoding utf8
+if (Invoke-EditorBuild) {
     Write-Output "GREEN $CandidateId"
-} else {
-    Remove-Item $src -Force -ErrorAction SilentlyContinue   # revert live tree to Python-only
-    Write-Output "RED $CandidateId (exit=$exit)"
+    exit 0
 }
+
+# RED: remove the bad source (tracked -> checkout HEAD; untracked -> delete), then rebuild prior good.
+& git -C $PluginRoot checkout -- $GeneratedCpp 2>$null
+$abs = Join-Path $PluginRoot $GeneratedCpp
+if (Test-Path $abs) { Remove-Item $abs -Force }   # was untracked
+$recovered = Invoke-EditorBuild
+if (-not $recovered) {
+    throw "RED $CandidateId AND prior-good rebuild FAILED — manual intervention needed."
+}
+Write-Output "RED $CandidateId"
+exit 1
 ```
 
-- [ ] **Step 2: Test GREEN path against the unmodified plugin**
+- [ ] **Step 2: Test the editor-running guard (real, testable now)**
 
+The editor is currently running. Run (no override, so the guard fires):
 ```powershell
-& 'M:\...\Build-ShadowTool.ps1' -CandidateId TEST-GREEN -GeneratedCpp 'Source/VibeUE/Private/Tools/Generated/_noop.cpp'
+& 'M:\UnrealProjects\Game\Plugins\VibeUE\Scripts\SelfImprove\Build-PendingTool.ps1' -GeneratedCpp 'Source/VibeUE/Private/Tools/Generated/_x.cpp'
 ```
-First create `Generated/_noop.cpp` containing only a comment (compiles, registers nothing).
-Expected: prints `GREEN TEST-GREEN`; a manifest `Saved/SelfImprove/pending-swap/TEST-GREEN.json` exists. Live MCP unaffected (we never swapped).
+Expected: throws `UnrealEditor is running; close it before building (it locks the plugin DLL).` and does nothing else.
 
-- [ ] **Step 3: Test RED path with a deliberately-broken .cpp**
+- [ ] **Step 3: Test the RED rollback file-logic with the test seam (no real build)**
 
-Create `Generated/_broken.cpp` with `#error forced red`. Run the script with that file.
-Expected: prints `RED TEST-GREEN (exit=...)`; no manifest written; `Generated/_broken.cpp` deleted from the live tree (verify `Test-Path` is `$false`). **Live MCP still up** — confirm by calling any `mcp__vibeue__manage_asset(action='help')`.
-
-- [ ] **Step 4: Clean up test artifacts and commit the script**
-
+Create an untracked dummy `Source/VibeUE/Private/Tools/Generated/_red.cpp` (a comment line). Run:
 ```powershell
-Remove-Item 'M:\UnrealProjects\Game\Saved\SelfImprove\pending-swap\TEST-GREEN.json' -ErrorAction SilentlyContinue
+& '...\Build-PendingTool.ps1' -GeneratedCpp 'Source/VibeUE/Private/Tools/Generated/_red.cpp' -BuildResultOverride RED
+```
+Expected: prints `RED `; the dummy file is removed (`Test-Path` → `$false`). (The seam makes both the initial and the recovery `Invoke-EditorBuild` return red→… note: with override RED the recovery build also returns red and the script will throw at the end — that is acceptable for this file-logic test; assert the file was removed BEFORE the throw. Alternatively run with the file untracked and confirm removal, ignoring the final throw.) Then test GREEN seam: create `_green.cpp`, run with `-BuildResultOverride GREEN`, expect `GREEN ` and the file left in place.
+
+- [ ] **Step 4: Script-parse check + cleanup + commit**
+
+Validate the script parses (catches syntax errors without running):
+```powershell
+$null = [System.Management.Automation.Language.Parser]::ParseFile('M:\UnrealProjects\Game\Plugins\VibeUE\Scripts\SelfImprove\Build-PendingTool.ps1', [ref]$null, [ref]$null)
+```
+Expected: no parse errors thrown. Remove any `_red.cpp`/`_green.cpp`/`_x.cpp` test files, then:
+```powershell
 cd 'M:\UnrealProjects\Game\Plugins\VibeUE'
-git add Scripts/SelfImprove/Build-ShadowTool.ps1
-git commit -m "feat(self-improve): shadow-build script with green/red gate"
+git add Scripts/SelfImprove/Build-PendingTool.ps1
+git commit -m "feat(self-improve): in-place build script with green/red gate + rollback"
 ```
 
 ---
 
-## Task 5: `Apply-PendingSwap.ps1` — deferred gated swap at session start
+## Task 5: `Apply-PendingBuild.ps1` — session-start launcher
 
 **Files:**
-- Create: `Scripts/SelfImprove/Apply-PendingSwap.ps1`
+- Create: `Scripts/SelfImprove/Apply-PendingBuild.ps1`
 
-Behavior: at the next editor start, for each manifest in the staging dir: copy the shadow-built binary over the live `Binaries/Win64`, ensure the generated source is committed to the live fork checkout, then remove the manifest. Editor must be **closed** when this runs (it replaces a loaded DLL).
+Behavior: at the next session start (editor closed), for each pending-build marker in the staging dir: call `Build-PendingTool.ps1` for its `generated_cpp`/`build_target`/`build_config`. **GREEN** → `git add`+commit the generated source, update the candidate state, remove the marker. **RED** → the source was already rolled back by Task 4; just remove the marker (the recipe stays as the Python fallback). Then the caller launches the editor. No markers → no-op.
+
+> Same testability constraint as Task 4: the real build path can't run mid-session. The script takes a `-BuildScript` param (defaulting to `Build-PendingTool.ps1`) so tests can inject a fake builder that echoes GREEN/RED without an editor shutdown.
 
 - [ ] **Step 1: Write the script**
 
-Create `Scripts/SelfImprove/Apply-PendingSwap.ps1`:
+Create `Scripts/SelfImprove/Apply-PendingBuild.ps1`:
 
 ```powershell
 [CmdletBinding()]
 param(
-    [string]$PluginRoot = 'M:\UnrealProjects\Game\Plugins\VibeUE',
-    [string]$StageDir   = 'M:\UnrealProjects\Game\Saved\SelfImprove\pending-swap'
+    [string]$PluginRoot  = 'M:\UnrealProjects\Game\Plugins\VibeUE',
+    [string]$StageDir    = 'M:\UnrealProjects\Game\Saved\SelfImprove\pending-build',
+    [string]$BuildScript = ''   # defaults to Build-PendingTool.ps1 next to this script
 )
 $ErrorActionPreference = 'Stop'
-if (-not (Test-Path $StageDir)) { Write-Output 'no pending swaps'; return }
+if (-not $BuildScript) { $BuildScript = Join-Path $PSScriptRoot 'Build-PendingTool.ps1' }
+if (-not (Test-Path $StageDir)) { Write-Output 'no pending builds'; return }
 
-# Refuse to run while the editor holds the DLL.
-if (Get-Process -Name 'UnrealEditor' -ErrorAction SilentlyContinue) {
-    throw 'UnrealEditor is running; close it before applying a swap.'
-}
+$markers = Get-ChildItem "$StageDir\*.json" -ErrorAction SilentlyContinue
+if (-not $markers) { Write-Output 'no pending builds'; return }
 
-foreach ($m in Get-ChildItem "$StageDir\*.json") {
+foreach ($m in $markers) {
     $man = Get-Content $m -Raw | ConvertFrom-Json
-    # 1. Swap the built binary into the live plugin.
-    Copy-Item "$($man.shadow_root)\$($man.binary_dir)\*" "$PluginRoot\$($man.binary_dir)\" -Recurse -Force
-    # 2. Make sure the generated source is in the live tree + committed on the fork branch.
-    foreach ($f in $man.source_files) {
-        Copy-Item "$($man.shadow_root)\$f" "$PluginRoot\$f" -Force
-        & git -C $PluginRoot add $f
+    $result = & $BuildScript -GeneratedCpp $man.generated_cpp -CandidateId $man.id `
+        -BuildTarget $man.build_target -BuildConfig $man.build_config
+    if ("$result" -match '^GREEN') {
+        & git -C $PluginRoot add $man.generated_cpp
+        & git -C $PluginRoot commit -m "feat(self-improve): apply generated tool $($man.tool_name) [$($man.id)]"
+        Write-Output "APPLIED $($man.id)"
+    } else {
+        Write-Output "ROLLED-BACK $($man.id)"
     }
-    & git -C $PluginRoot commit -m "feat(self-improve): apply generated tool $($man.tool_name) [$($man.id)]"
-    # 3. Done — clear the manifest.
     Remove-Item $m -Force
-    Write-Output "APPLIED $($man.id)"
 }
 ```
 
-- [ ] **Step 2: Test apply with the `_noop` GREEN manifest from Task 4**
+- [ ] **Step 2: Test no-marker no-op (real, testable now)**
 
-Re-stage `TEST-GREEN.json` (re-run Task 4 Step 2). Ensure the editor is closed. Run:
+Ensure `Saved/SelfImprove/pending-build/` is empty or absent, then run:
 ```powershell
-& 'M:\...\Apply-PendingSwap.ps1'
+& 'M:\UnrealProjects\Game\Plugins\VibeUE\Scripts\SelfImprove\Apply-PendingBuild.ps1'
 ```
-Expected: prints `APPLIED TEST-GREEN`; manifest removed; a commit exists on the fork branch adding `Generated/_noop.cpp`. (No real tool registered — `_noop` is empty — so nothing to call; success = clean apply + cleared queue.)
+Expected: prints `no pending builds`; no git activity.
 
-- [ ] **Step 3: Test the running-editor guard**
+- [ ] **Step 3: Test the GREEN loop with a fake builder (no real build)**
 
-With the editor open, run the script. Expected: throws `UnrealEditor is running; close it before applying a swap.` and changes nothing.
+Create a fake builder `Saved/SelfImprove/_fakebuild.ps1` that ignores args and prints `GREEN test`:
+```powershell
+'param($GeneratedCpp,$CandidateId,$BuildTarget,$BuildConfig); Write-Output "GREEN $CandidateId"' |
+  Set-Content 'M:\UnrealProjects\Game\Saved\SelfImprove\_fakebuild.ps1' -Encoding utf8
+```
+Stage a marker for an already-committed file (use the `_SCHEMA.md`-style fields but point `generated_cpp` at a real tracked file that `git add` will no-op on, e.g. `docs/self-improve/tool-candidates/.gitkeep`) and run with the fake builder. Expected: prints `APPLIED <id>`; the marker is removed; a commit is created (may be empty/no-op on an unchanged tracked file — acceptable for this wiring test). Then test a fake `RED` builder and confirm `ROLLED-BACK <id>` + marker removed + NO commit.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Parse-check, cleanup, commit**
 
 ```powershell
+$null = [System.Management.Automation.Language.Parser]::ParseFile('M:\UnrealProjects\Game\Plugins\VibeUE\Scripts\SelfImprove\Apply-PendingBuild.ps1', [ref]$null, [ref]$null)
+Remove-Item 'M:\UnrealProjects\Game\Saved\SelfImprove\_fakebuild.ps1' -ErrorAction SilentlyContinue
 cd 'M:\UnrealProjects\Game\Plugins\VibeUE'
-git add Scripts/SelfImprove/Apply-PendingSwap.ps1
-git commit -m "feat(self-improve): deferred gated-swap applier"
+git add Scripts/SelfImprove/Apply-PendingBuild.ps1
+git commit -m "feat(self-improve): session-start launcher (build pending, commit green)"
 ```
 
-> **Hook wiring is deferred:** whether `Apply-PendingSwap.ps1` is invoked by a Claude Code SessionStart hook or by the user's editor-launch `.bat` is decided when we wire it (Task 9 dry-run uses it manually first). The script is safe to call unconditionally — it no-ops with `no pending swaps`.
+> **Hook wiring is deferred:** whether `Apply-PendingBuild.ps1` runs from a Claude Code SessionStart hook or the user's editor-launch `.bat` is decided when we wire it (Task 9 runs it manually first). It is safe to call unconditionally — it no-ops with `no pending builds`. The real green/red build is exercised end-to-end in Task 9 at an editor-closed window.
 
 ---
 
-## Task 6: Add CLASSIFY / QUEUE / GENERATE / SWAP to the skill
+## Task 6: Add CLASSIFY / QUEUE / GENERATE / BUILD to the skill
 
 **Files:**
 - Modify: `~/.claude/skills/vibeue-self-improve/SKILL.md`
@@ -376,21 +390,23 @@ LIVE-VERIFIED, classify it:
 - **When unsure if reusable → write nothing** (log-only bias).
 ```
 
-- [ ] **Step 2: Add GENERATE + SWAP phases**
+- [ ] **Step 2: Add GENERATE + BUILD phases**
 
 Append to the `## Phases` list:
 
 ```markdown
 9. **GENERATE (simple-wrapper only, autonomous)** — fill
    `templates/simple-wrapper.cpp.tmpl` from the candidate into
-   `Source/VibeUE/Private/Tools/Generated/<Name>Tool.cpp`. Run
-   `Scripts/SelfImprove/Build-ShadowTool.ps1 -CandidateId <id> -GeneratedCpp <path>`.
-   GREEN → set candidate `state: green`, manifest staged. RED → `state: red`,
-   keep the Python recipe, append a red record to the gap log. The live MCP is
-   never touched either way.
-10. **SWAP (next session start)** — `Scripts/SelfImprove/Apply-PendingSwap.ps1`
-    runs with the editor closed, swaps the binary, commits the source to the
-    fork, clears the manifest. The new tool is live this session.
+   `Source/VibeUE/Private/Tools/Generated/<Name>Tool.cpp` (live tree), then write a
+   pending-build marker to `Game/Saved/SelfImprove/pending-build/<id>.json`
+   (schema: tool-candidates/_SCHEMA.md). The live MCP keeps running on the old
+   binary; nothing is built mid-session.
+10. **BUILD (next session start, editor closed)** —
+    `Scripts/SelfImprove/Apply-PendingBuild.ps1` runs the in-place build for each
+    pending marker via `Build-PendingTool.ps1`. GREEN → commit the `.cpp` to the
+    fork, set candidate `state: applied`, the new tool is live this session. RED →
+    the `.cpp` is auto-rolled-back (`git checkout`) and the prior good state rebuilt;
+    set `state: red`, keep the Python recipe, append a red record to the gap log.
 ```
 
 - [ ] **Step 3: Update the autonomy table for the carve-out**
@@ -402,7 +418,7 @@ Replace the `## Autonomy` table with:
 | Tier | Action | Gate |
 |------|--------|------|
 | Skill | write/commit a verified skill doc to the fork | autonomous |
-| C++ — simple wrapper | generate, shadow-build, deferred swap | autonomous (gated by green build + next-session swap) |
+| C++ — simple wrapper | generate .cpp in live tree, in-place build at editor-closed window, auto-rollback on red | autonomous (gated by green build; no human gate) |
 | C++ — complex | edit service/MCP, build, restart editor, commit | explicit "go" required first |
 ```
 
@@ -412,7 +428,7 @@ Copy the live skill over the fork snapshot so they are byte-identical, then:
 ```powershell
 cd 'M:\UnrealProjects\Game\Plugins\VibeUE'
 git add docs/self-improve/vibeue-self-improve.SKILL.md
-git commit -m "feat(self-improve): skill v2 — classify, generate (shadow), deferred swap"
+git commit -m "feat(self-improve): skill v2 — classify, generate, in-place build at session start"
 ```
 
 - [ ] **Step 5: Verify** — the live `SKILL.md` and the fork snapshot are identical (`git diff --no-index` between them reports no differences).
@@ -456,7 +472,7 @@ git commit -m "docs(self-improve): gap-log auto-cycle outcome fields"
 - [ ] **Step 1: Amend the Autonomy bullet**
 
 Change the memory's autonomy line from "C++ … are **approval-gated**" to record the v2 carve-out:
-> Autonomy: skill-tier autonomous; **simple-wrapper C++ tools auto-generated via shadow-build + deferred next-session swap (no human gate)**; complex C++ service-method changes remain approval-gated. See spec `2026-06-04-vibeue-autotool-from-python-design.md`.
+> Autonomy: skill-tier autonomous; **simple-wrapper C++ tools auto-generated, built in-place at the next editor-closed window with git-checkout auto-rollback on red (no human gate)**; complex C++ service-method changes remain approval-gated. See spec `2026-06-04-vibeue-autotool-from-python-design.md`.
 
 - [ ] **Step 2: Verify** — re-reading the memory shows no contradiction with the v1 line; the carve-out is explicit. (Memory files are not committed to the fork; this is a local `.claude` write.)
 
@@ -468,17 +484,17 @@ Change the memory's autonomy line from "C++ … are **approval-gated**" to recor
 
 - [ ] **Step 1: Pick a real candidate** — use a genuinely reusable one-API-call op not yet covered by a tool (e.g. the `set_world_killz` from the KillZ gap GAP-20260603-1). Write its `CAND-…` record per `_SCHEMA.md`.
 
-- [ ] **Step 2: GENERATE** — fill the template into `Source/VibeUE/Private/Tools/Generated/SetWorldKillZTool.cpp`. Fix any compile-shape issues the moment Task 4's build reports them (this is where the Task 2 ⚠️ field-verify resolves).
+- [ ] **Step 2: GENERATE** — fill the template into `Source/VibeUE/Private/Tools/Generated/SetWorldKillZTool.cpp` (live tree) and write the pending-build marker `Game/Saved/SelfImprove/pending-build/CAND-20260604-1.json` per `_SCHEMA.md`. This is where the Task 2 field-verified symbols meet a real compile.
 
-- [ ] **Step 3: Shadow-build** —
+- [ ] **Step 3: BUILD at an editor-closed window (the hard build gate)** — **close the editor** (this also ends the current MCP session), then run the launcher:
 ```powershell
-& 'M:\...\Build-ShadowTool.ps1' -CandidateId CAND-20260604-1 -GeneratedCpp 'Source/VibeUE/Private/Tools/Generated/SetWorldKillZTool.cpp'
+& 'M:\UnrealProjects\Game\Plugins\VibeUE\Scripts\SelfImprove\Apply-PendingBuild.ps1'
 ```
-Expected: `GREEN CAND-20260604-1`; manifest staged. If RED, read the build log, fix the template/instance, repeat. Live MCP stays up throughout.
+Expected: it invokes `Build-PendingTool.ps1`, which runs `Build.bat GameEditor Win64 DebugGame "M:\UnrealProjects\Game\Game.uproject" -waitmutex`. GREEN → prints `APPLIED CAND-20260604-1` + a fork commit; the rebuilt DLL is the live binary. RED → prints `ROLLED-BACK CAND-20260604-1`, the `.cpp` is removed and the prior good state rebuilt; read the build stdout, fix the generated `.cpp` (or the template), regenerate, repeat.
 
-- [ ] **Step 4: SWAP** — close the editor, run `Apply-PendingSwap.ps1`, expect `APPLIED CAND-20260604-1` + a fork commit.
+- [ ] **Step 4: Launch the editor** — start the editor normally (its DLL is the freshly built one).
 
-- [ ] **Step 5: Verify the new tool LIVE next session** — start the editor, confirm the MCP exposes the new tool, call it (set a known KillZ), and observe the effect via `read_pcg_graph`-style read or `execute_python_code` read-back. **This live call is the hard gate** — no live proof, no LOG.
+- [ ] **Step 5: Verify the new tool LIVE** — confirm the MCP exposes `set_world_killz`, call it (set a known KillZ), and observe the effect via an `execute_python_code` read-back of `kill_z`. **This live call is the hard gate** — no live proof, no LOG.
 
 - [ ] **Step 6: LOG + finalise** — append the resolved gap record (with `Auto-cycle: generated-green(set_world_killz)` and the resolution sha in a separate commit), set the candidate `state: applied`. Push the branch to `fork` only when the user asks.
 
@@ -486,8 +502,10 @@ Expected: `GREEN CAND-20260604-1`; manifest staged. If RED, read the build log, 
 
 ## Self-Review
 
-**Spec coverage:** §4 components → Task 6 (classifier/queue refs), Task 1 (queue), Task 2+9 (generator), Task 4 (shadow-build gate), Task 5 (swap launcher), Task 7 (gap log). §5 simple-wrapper def → Task 6 Step 1. §6 isolation invariants → Task 4 (green/red, live untouched) + Task 5 (editor-closed guard). §8 carve-out → Task 6 Step 3 + Task 8. §9 artifact locations → File Structure table. ✅ all covered.
+**Spec coverage:** §4 components → Task 6 (classifier/queue refs), Task 1 (queue), Task 2+9 (generator), Task 4 (in-place build gate + rollback), Task 5 (session-start launcher), Task 7 (gap log). §5 simple-wrapper def → Task 6 Step 1. §6 in-place build + rollback invariants → Task 4 (green/red, editor-closed guard, rollback) + Task 5 (loop + commit green). §8 carve-out → Task 6 Step 3 + Task 8. §9 artifact locations → File Structure table. ✅ all covered.
 
-**Open risk surfaced honestly:** Task 3 verifies the unproven `BuildPlugin.bat` isolation assumption before any script depends on it, with an explicit STOP-and-report fallback. Task 2 marks the C++-symbol details as field-verified at Task 4/9, not assumed.
+**Model revised 2026-06-04 (Task 3 outcome):** shadow-build isolation was found unworkable in this tree (host-project in-place build; live editor is DebugGame). Switched to in-place build + `git checkout` auto-rollback at the editor-closed boundary. Spec §1/§3/§4/§6/§8/§9 and Tasks 4/5/6/8/9 updated accordingly.
 
-**Type/name consistency:** candidate id form `CAND-<YYYYMMDD>-<n>`, manifest keys (`shadow_root`, `binary_dir`, `source_files`, `tool_name`), script param names (`-CandidateId`, `-GeneratedCpp`), staging path, and shadow root are identical across Tasks 1, 4, 5, 9. ✅
+**Testability constraint surfaced honestly:** the real build needs the editor closed, but this MCP session runs inside the live editor — so Tasks 4/5 can only test the guard, parse, and (via test seams) the rollback/loop logic mid-session; the real green/red build is exercised only in Task 9 at an editor-closed window. Stated in Tasks 4, 5, 9.
+
+**Type/name consistency:** candidate id form `CAND-<YYYYMMDD>-<n>`; pending-build marker keys (`generated_cpp`, `build_target`, `build_config`, `tool_name`, `id`); script names (`Build-PendingTool.ps1`, `Apply-PendingBuild.ps1`) and params (`-GeneratedCpp`, `-CandidateId`, `-BuildTarget`, `-BuildConfig`, `-BuildResultOverride`, `-BuildScript`); staging path `Game/Saved/SelfImprove/pending-build/`; generated path `Source/VibeUE/Private/Tools/Generated/` — identical across Tasks 1, 4, 5, 6, 9. ✅
