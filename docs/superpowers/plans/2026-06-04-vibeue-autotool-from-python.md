@@ -301,6 +301,10 @@ git commit -m "feat(self-improve): in-place build script with green/red gate + r
 Behavior: at the next session start (editor closed), for each pending-build marker in the staging dir: call `Build-PendingTool.ps1` for its `generated_cpp`/`build_target`/`build_config`. **GREEN** → `git add`+commit the generated source, update the candidate state, remove the marker. **RED** → the source was already rolled back by Task 4; just remove the marker (the recipe stays as the Python fallback). Then the caller launches the editor. No markers → no-op.
 
 > Same testability constraint as Task 4: the real build path can't run mid-session. The script takes a `-BuildScript` param (defaulting to `Build-PendingTool.ps1`) so tests can inject a fake builder that echoes GREEN/RED without an editor shutdown.
+>
+> **Why a CHILD PROCESS for the builder (load-bearing):** `Build-PendingTool.ps1` ends each path with `exit 0/1`. PowerShell's `& path.ps1` runs the script **in the current process**, so an `exit` there would terminate THIS launcher after the first candidate. We therefore invoke the builder via `powershell.exe -File` (a real child process) — `exit` then only ends the child, and we read its stdout + `$LASTEXITCODE`. (The code review that approved Task 4 assumed a child process; this makes that assumption true.)
+>
+> **Three-way result (from the Task 4 review):** GREEN → commit + clear marker; clean RED (`.cpp` rolled back, prior good rebuilt) → clear marker, keep Python recipe; **double-RED** (builder threw — prior-good rebuild also failed → neither GREEN nor RED in stdout) → **leave the marker** and stop loudly; the tree may be non-building and needs a human.
 
 - [ ] **Step 1: Write the script**
 
@@ -322,16 +326,32 @@ if (-not $markers) { Write-Output 'no pending builds'; return }
 
 foreach ($m in $markers) {
     $man = Get-Content $m -Raw | ConvertFrom-Json
-    $result = & $BuildScript -GeneratedCpp $man.generated_cpp -CandidateId $man.id `
-        -BuildTarget $man.build_target -BuildConfig $man.build_config
-    if ("$result" -match '^GREEN') {
+    # Run the builder in a CHILD process so its `exit` cannot terminate this launcher.
+    # Capture STDOUT ONLY (no 2>&1): clean RED prints "RED ..." via Write-Output -> stdout;
+    # a double-RED `throw` goes to the child's STDERR and never reaches $out, so it falls to
+    # the else branch below. (Merging stderr would false-match the real "RED ... FAILED" throw.)
+    # Not redirecting stderr also avoids the PS5.1 NativeCommandError-with-Stop pitfall.
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $BuildScript `
+        -GeneratedCpp $man.generated_cpp -CandidateId $man.id `
+        -BuildTarget $man.build_target -BuildConfig $man.build_config | Out-String
+
+    if ($out -match '(?m)^GREEN') {
         & git -C $PluginRoot add $man.generated_cpp
         & git -C $PluginRoot commit -m "feat(self-improve): apply generated tool $($man.tool_name) [$($man.id)]"
         Write-Output "APPLIED $($man.id)"
-    } else {
-        Write-Output "ROLLED-BACK $($man.id)"
+        Remove-Item $m -Force
     }
-    Remove-Item $m -Force
+    elseif ($out -match '(?m)^RED') {
+        # Build failed but the .cpp was rolled back and the prior good state rebuilt — tree is clean.
+        Write-Output "ROLLED-BACK $($man.id)"
+        Remove-Item $m -Force
+    }
+    else {
+        # Double-RED: builder threw (prior-good rebuild also failed; its error went to stderr,
+        # not $out). Tree may not compile. Keep the marker for inspection and stop loudly.
+        Write-Warning "BUILD-BROKEN $($man.id): builder produced no GREEN/RED verdict on stdout."
+        throw "Self-improve left the tree non-building for $($man.id); marker kept at $($m.FullName)."
+    }
 }
 ```
 
@@ -343,21 +363,37 @@ Ensure `Saved/SelfImprove/pending-build/` is empty or absent, then run:
 ```
 Expected: prints `no pending builds`; no git activity.
 
-- [ ] **Step 3: Test the GREEN loop with a fake builder (no real build)**
+- [ ] **Step 3: Test the three-way loop with fake builders (no real build)**
 
-Create a fake builder `Saved/SelfImprove/_fakebuild.ps1` that ignores args and prints `GREEN test`:
+The launcher invokes the builder via `powershell.exe -File`, so the fake must be a `.ps1` that declares the same params and prints a verdict. Create three fakes and a staging dir:
 ```powershell
-'param($GeneratedCpp,$CandidateId,$BuildTarget,$BuildConfig); Write-Output "GREEN $CandidateId"' |
-  Set-Content 'M:\UnrealProjects\Game\Saved\SelfImprove\_fakebuild.ps1' -Encoding utf8
+$d = 'M:\UnrealProjects\Game\Saved\SelfImprove'
+New-Item -ItemType Directory -Force "$d\pending-build" | Out-Null
+'param($GeneratedCpp,$CandidateId,$BuildTarget,$BuildConfig); Write-Output "GREEN $CandidateId"' | Set-Content "$d\_fakegreen.ps1" -Encoding utf8
+'param($GeneratedCpp,$CandidateId,$BuildTarget,$BuildConfig); Write-Output "RED $CandidateId"'   | Set-Content "$d\_fakered.ps1"   -Encoding utf8
+'param($GeneratedCpp,$CandidateId,$BuildTarget,$BuildConfig); throw "double-red"'                | Set-Content "$d\_fakebroken.ps1" -Encoding utf8
 ```
-Stage a marker for an already-committed file (use the `_SCHEMA.md`-style fields but point `generated_cpp` at a real tracked file that `git add` will no-op on, e.g. `docs/self-improve/tool-candidates/.gitkeep`) and run with the fake builder. Expected: prints `APPLIED <id>`; the marker is removed; a commit is created (may be empty/no-op on an unchanged tracked file — acceptable for this wiring test). Then test a fake `RED` builder and confirm `ROLLED-BACK <id>` + marker removed + NO commit.
+
+**GREEN sub-test** — generated_cpp points at a NEW throwaway file so the commit is real, then undo it:
+```powershell
+'// wire test' | Set-Content 'M:\UnrealProjects\Game\Plugins\VibeUE\Source\VibeUE\Private\Tools\Generated\_wire.cpp' -Encoding utf8
+'{ "id":"WIRE-1","tool_name":"wire","generated_cpp":"Source/VibeUE/Private/Tools/Generated/_wire.cpp","build_target":"GameEditor","build_config":"DebugGame","state":"pending-build" }' | Set-Content "$d\pending-build\WIRE-1.json" -Encoding utf8
+& '...\Apply-PendingBuild.ps1' -BuildScript "$d\_fakegreen.ps1"
+```
+Expected: prints `APPLIED WIRE-1`; marker `WIRE-1.json` removed; a commit added `_wire.cpp`. Cleanup: `git -C <plugin> reset --soft HEAD~1`, then `git -C <plugin> restore --staged Source/VibeUE/Private/Tools/Generated/_wire.cpp`, then delete `_wire.cpp`.
+
+**RED sub-test** — re-stage `WIRE-1.json`, run with `_fakered.ps1`. Expected: prints `ROLLED-BACK WIRE-1`; marker removed; NO new commit (`git -C <plugin> log -1 --format=%s` unchanged).
+
+**Double-RED sub-test** — re-stage `WIRE-1.json`, run with `_fakebroken.ps1`. Expected: the launcher **throws** `Self-improve left the tree non-building for WIRE-1…` and the marker `WIRE-1.json` is **NOT removed** (`Test-Path` → `$true`). Then delete the marker manually to clean up.
 
 - [ ] **Step 4: Parse-check, cleanup, commit**
 
 ```powershell
 $null = [System.Management.Automation.Language.Parser]::ParseFile('M:\UnrealProjects\Game\Plugins\VibeUE\Scripts\SelfImprove\Apply-PendingBuild.ps1', [ref]$null, [ref]$null)
-Remove-Item 'M:\UnrealProjects\Game\Saved\SelfImprove\_fakebuild.ps1' -ErrorAction SilentlyContinue
+Remove-Item 'M:\UnrealProjects\Game\Saved\SelfImprove\_fake*.ps1','M:\UnrealProjects\Game\Saved\SelfImprove\pending-build\*.json' -ErrorAction SilentlyContinue
+Remove-Item 'M:\UnrealProjects\Game\Plugins\VibeUE\Source\VibeUE\Private\Tools\Generated\_wire.cpp' -ErrorAction SilentlyContinue
 cd 'M:\UnrealProjects\Game\Plugins\VibeUE'
+git status --short   # expect clean (no stray test files)
 git add Scripts/SelfImprove/Apply-PendingBuild.ps1
 git commit -m "feat(self-improve): session-start launcher (build pending, commit green)"
 ```
