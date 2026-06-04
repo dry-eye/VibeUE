@@ -28,3 +28,17 @@ Append-only. Format defined in `README.md`.
 - **Commit:** 086162b
 
 ---
+
+## GAP-00000000-0: (example) auto-generated simple-wrapper tool
+- **Date:** 0000-00-00
+- **Intent:** (example) Surface a reusable one-call Python op (set World Settings KillZ) as a first-class MCP tool.
+- **Searched:** manage_skills(list) — no tool wraps it; discover_python_* — only the raw editor-property call.
+- **Why no tool:** Recurring simple-wrapper op had no dedicated MCP tool; kept dropping to execute_python_code.
+- **Tier:** cpp
+- **Auto-cycle:** generated-green(set_world_killz)
+- **Tool name:** set_world_killz
+- **Artifact:** Source/VibeUE/Private/Tools/Generated/SetWorldKillZTool.cpp
+- **Verified:** (example) Built in-place green at editor-closed window; tool called live, KillZ read back correctly.
+- **Commit:** 0000000
+
+---

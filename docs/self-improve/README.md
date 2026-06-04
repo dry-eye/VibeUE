@@ -22,6 +22,8 @@ Each record is one section appended to `gap-log.md`:
 - **Tier:** skill | cpp | unresolved
 - **Artifact:** path to the skill/section or C++ method, or issue link
 - **Verified:** the live-run evidence observed in the editor
+- **Auto-cycle:** none | candidate(<id>) | generated-green(<tool>) | generated-red(<reason>)
+- **Tool name:** <mcp tool name, if a wrapper was generated>
 - **Commit:** <sha> (on the fork)
 ```
 
