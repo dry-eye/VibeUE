@@ -24,16 +24,21 @@ captures it and, for simple cases, closes the loop autonomously.
 - **Autonomous C++ generation limited to *simple wrappers*** (single Python-API
   call surfaced as one MCP tool). Anything more complex is logged as a candidate
   for manual implementation — not auto-generated.
-- **Shadow-build isolation**: generated code is built in a separate worktree; the
-  live plugin binary is never touched by an unverified build.
-- **Deferred gated swap**: a green shadow-build is staged and applied only at the
-  **next session start**, never via a surprise mid-session editor restart.
+- **In-place build with auto-rollback** (see §6, revised 2026-06-04 after Task 3):
+  at the next editor-closed window, the generated `.cpp` is added to the live tree
+  and the editor target is rebuilt in the live config; **green** keeps it, **red**
+  rolls the `.cpp` back via `git checkout` and rebuilds the prior good state.
+- **Deferred to next session start**: generation may happen mid-task, but the build
+  (and therefore the tool going live) waits for the editor-closed boundary — never a
+  surprise mid-session editor restart.
 
 ### Out of scope (v1)
 - Auto-generation of complex/multi-step tools (logged for manual work instead).
-- In-session use of a freshly generated tool (physically impossible: build +
-  editor restart barrier — see §3).
-- Auto-build *in-place* and auto-rollback (rejected in favour of shadow isolation).
+- In-session use of a freshly generated tool (physically impossible: a UE plugin's
+  editor module cannot rebuild while the editor holds its DLL — see §2/§6).
+- **Shadow-worktree isolation** (originally chosen, but Task 3 found the plugin
+  cannot build in isolation in this tree — `BuildPlugin.bat` is a host-project
+  in-place build; see §6).
 - CI-gated builds (considered, deferred to a later iteration).
 
 ## 2. Why "in parallel, use immediately" is impossible
@@ -49,10 +54,10 @@ usage, generate offline, make it available next session".
 
 | # | Decision | Choice | Consequence |
 |---|----------|--------|-------------|
-| 1 | Scope | Full auto-cycle (gen → shadow-build → swap → use next session) | No per-step human approval on the simple-wrapper path |
-| 2 | Build isolation | **Shadow-build + gated swap** | Live MCP is physically untouched until an isolated build is green |
+| 1 | Scope | Full auto-cycle (gen → build → use next session) | No per-step human approval on the simple-wrapper path |
+| 2 | Build isolation | **In-place build + auto-rollback** (revised 2026-06-04; was shadow-build) | Build happens in the live tree at an editor-closed window; red rolls back via `git checkout` + rebuild. Plugin can't build isolated here (Task 3) |
 | 3 | Trigger | **Intent classification** (reusable vs one-off) | Auto-cycle only for reusable calls; **default to logging-only when uncertain** |
-| 4 | Swap/restart timing | **At next session start** | Zero interruptions; no surprise restart; no PIE/work loss |
+| 4 | Build/restart timing | **At next session start (editor closed)** | Zero interruptions; build+go-live collapse into the one window the editor is already down |
 
 ## 4. Architecture — six components
 
@@ -60,9 +65,9 @@ usage, generate offline, make it available next session".
 |------|----------------|------------|
 | Intent classifier | Per `execute_python_code` call, decide reusable vs one-off; if reusable AND uncovered by tool/skill → emit a candidate | model judgement; existing detection gate (`manage_skills`, `discover_python_*`) |
 | Candidate queue | Persist pending candidates (intent, live-verified recipe, C++ signature sketch, complexity class) | filesystem (fork) |
-| Generator | For a **simple-wrapper** candidate, generate C++ service method + MCP-tool registration **in a shadow worktree** | C++ templates; fork worktree |
-| Shadow-build gate | Build the plugin in the shadow worktree; parse accounting/`Result:`; green → stage binary + swap manifest, red → discard + log | `ProjectCompile`/`BuildPlugin`; `[ProjectCompileAccounting]` |
-| Gated swap launcher | At next editor start, apply staged source + binary to live fork checkout, then launch | SessionStart hook or `.bat` launcher wrapper |
+| Generator | For a **simple-wrapper** candidate, write the C++ tool registration `.cpp` into the live tree (`Source/VibeUE/Private/Tools/Generated/`) | C++ template (`REGISTER_VIBEUE_TOOL`) |
+| In-place build + rollback gate | At an editor-closed window, rebuild the editor target (live config) with the generated `.cpp` present; parse `Result: Succeeded`; **green** → keep + commit, **red** → `git checkout` the `.cpp` + rebuild prior good state + log | `Build.bat <Project>Editor Win64 <Config>` (UBT); `Result: Succeeded` |
+| Session-start launcher | Ensure editor closed → run the build gate for each pending candidate → green commit / red rollback → launch editor | SessionStart hook or `.bat` launcher wrapper |
 | Gap log | Record each outcome (auto-resolved / red-build / manual-deferred) | git (fork) |
 
 ### Data flow
@@ -78,14 +83,19 @@ usage, generate offline, make it available next session".
                                   ┌───────────────┴───────────────┐
                           simple wrapper                      complex
                                   ▼                               ▼
-                            Generator (shadow worktree)     log for manual impl
-                                  ▼
-                            Shadow-build gate ──red──► discard + gap-log (keep Python recipe)
-                                  │ green
-                                  ▼
-                            stage binary + swap manifest
-                                  ▼
-                   ── next session start ──► Gated swap launcher ──► tool live this session
+                   Generator → .cpp in live tree            log for manual impl
+                                  │ (pending build marker)
+                   ── next session start (editor closed) ──► In-place build gate
+                                  │
+                    ┌─────────────┴─────────────┐
+                  red │                         │ green
+                      ▼                         ▼
+        git checkout .cpp + rebuild      keep .cpp + commit to fork
+        prior good state; gap-log;              │
+        keep Python recipe                      ▼
+                      │                  launch editor ──► tool live this session
+                      ▼
+               launch editor (prior good binaries)
 ```
 
 ## 5. Intent classification — definition of "reusable simple wrapper"
@@ -103,28 +113,45 @@ A candidate is **auto-generated** only when **all** hold:
 If (1) or (2) is uncertain → **log-only** (err toward not generating). If (3) fails
 → record as a **manual candidate**, never auto-generate.
 
-## 6. Shadow-build + gated swap
+## 6. In-place build + auto-rollback (revised 2026-06-04 after Task 3)
 
-- The generator writes C++ into a **shadow git worktree** of the fork, *not* the
-  live `Plugins/VibeUE` working tree.
-- The shadow worktree is built with the project's compile path; success is judged
-  **only** by `PROPAGATED_EXITCODE == 0` + `Result: Succeeded` (the established
-  accounting rule). A disagreeing host exit code is ignored.
-- **Green:** stage the built module binary + a `pending-swap` manifest (source
-  patch ref + binary path + candidate id) into a queue dir.
-- **Red:** discard the generated C++ entirely; the candidate **reverts to its
-  live-verified Python recipe** (which still works); append a red-build record to
-  the gap log. The live binary is never altered.
-- At **next session start**, the launcher checks the queue; for each green entry it
-  applies the source change to the live fork checkout, swaps the binary, then
-  launches the editor. The new tool is live for that session.
+**Why not shadow isolation (original plan):** Task 3 established that in this tree a
+VibeUE build is a **host-project in-place build** — `BuildPlugin.bat` walks up to
+`Game.uproject` and runs `Build.bat GameEditor` (UBT), writing the plugin DLL
+in-place. A UE plugin's editor module cannot be compiled in isolation against a
+bare engine without risk, and the live editor runs a specific config (**DebugGame**)
+the build must match. `VibeUE.Build.cs` has **no project-module dependencies**, so a
+standalone UAT `BuildPlugin` was theoretically possible, but it builds Development
+against the bare engine — config-mismatched with the live DebugGame editor and not
+worth the fragility. Since the build **and** the go-live both require the editor
+closed anyway, isolation buys little. Chosen model: build in place, roll back on red.
+
+- The generator writes the tool `.cpp` into the **live tree** at
+  `Source/VibeUE/Private/Tools/Generated/` and records a *pending-build* marker for
+  the candidate. The live MCP keeps running on the old binary until the next build.
+- At the **next session start, with the editor closed**, the launcher rebuilds the
+  editor target in the live config:
+  `Build.bat <Project>Editor Win64 <Config> "<...>.uproject" -waitmutex`.
+  Success is judged **only** by UBT `Result: Succeeded` (the `BuildPlugin.bat` banner
+  is unreliable; the script captures stdout itself — there is no fixed log file).
+- **Green:** keep the `.cpp`; the freshly built DLL is already the live binary;
+  commit the source to the fork. Launch the editor — the new tool is live.
+- **Red:** `git checkout -- <generated.cpp>` (and/or delete it) to remove the bad
+  source, **rebuild the prior good state** so the editor can still launch, append a
+  red-build record to the gap log, and **keep the candidate's live-verified Python
+  recipe** as the working fallback. Launch the editor on the restored binary.
 
 **Safety invariants:**
-- A bad generation can never reach the live binary (shadow isolation).
-- A red build degrades gracefully to "Python recipe still available".
-- No surprise editor restarts (swap only at a natural session boundary).
+- The build runs only when the editor is closed — the live MCP is down during the
+  one window its binary changes, so no half-swapped running editor.
+- A red build is recovered by rolling the `.cpp` back and rebuilding the prior good
+  state; the candidate degrades gracefully to "Python recipe still available".
+- No surprise editor restarts (build happens at a natural editor-closed boundary).
 - The **hard live-verification gate is preserved**: a recipe becomes a candidate
   only after it ran live in the editor and produced the observed result.
+- **Residual risk (accepted):** unlike shadow isolation, a red build temporarily
+  leaves the live tree non-building until rollback+rebuild completes. The launcher
+  must always finish with a green editor target before launching.
 
 ## 7. Error handling
 
@@ -133,8 +160,9 @@ If (1) or (2) is uncertain → **log-only** (err toward not generating). If (3) 
   catch it before it ships. Bias is toward log-only, so over-generation is rare.
 - **Classifier false-negative** (missed a reusable call): the call still worked via
   Python; the signal is simply lost this time — no regression vs today.
-- **Generation produces non-compiling C++:** caught by the shadow-build gate →
-  discarded → Python recipe retained → red-build logged.
+- **Generation produces non-compiling C++:** caught by the in-place build gate
+  (red) → `.cpp` rolled back via `git checkout` + prior good state rebuilt →
+  Python recipe retained → red-build logged.
 - **Green build, but new tool misbehaves at runtime next session:** treated as a
   normal gap on the next run; the tool can be reverted in the fork.
 
@@ -143,13 +171,13 @@ If (1) or (2) is uncertain → **log-only** (err toward not generating). If (3) 
 The v1 design (`§6` of the 2026-06-03 spec) states: *C++ service-method / MCP-tool
 changes require an explicit human "go" before editing.* This extension **reverses
 that for the simple-wrapper auto-cycle path**, replacing the *human-approval* gate
-with a **shadow-build-green + deferred-swap** gate.
+with an **in-place-build-green + auto-rollback** gate at the editor-closed boundary.
 
 | Path | Gate (v1) | Gate (v2) |
 |------|-----------|-----------|
 | Skill doc | Autonomous | Autonomous (unchanged) |
 | C++ — complex | Explicit "go" | Explicit "go" (unchanged; logged as manual candidate) |
-| C++ — **simple wrapper** | Explicit "go" | **Autonomous**, gated by green shadow-build + next-session swap |
+| C++ — **simple wrapper** | Explicit "go" | **Autonomous**, gated by green in-place build (red auto-rolls-back) at next session start |
 
 The project memory `project_vibeue_self_improve_pipeline.md` must be updated to
 record this carve-out so the two specs do not contradict.
@@ -157,10 +185,11 @@ record this carve-out so the two specs do not contradict.
 ## 9. Artifact locations (in the fork)
 
 - **Candidate queue:** `docs/self-improve/tool-candidates/` (one file per candidate;
-  schema TBD in the plan: intent, recipe, signature sketch, complexity class, state).
-- **Pending-swap queue:** a staging dir (path decided in the plan) holding green
-  binaries + swap manifests.
-- **Generated C++:** `Source/VibeUE/Private/PythonAPI/` (via shadow worktree).
+  schema in `_SCHEMA.md`: intent, recipe, signature sketch, complexity class, state).
+- **Pending-build queue:** a gitignored staging dir (`Game/Saved/SelfImprove/pending-build/`)
+  holding one marker per candidate awaiting the next editor-closed build — a pointer
+  to the generated `.cpp`, not a pre-built binary.
+- **Generated C++:** `Source/VibeUE/Private/Tools/Generated/` (in the live tree).
 - **Gap log:** `docs/self-improve/gap-log.md` — extended with auto-cycle outcome
   records (`GAP-<YYYYMMDD>-<n>`, resolution sha in a separate commit, as today).
 
@@ -169,11 +198,12 @@ record this carve-out so the two specs do not contradict.
 - Define the candidate-record schema and the pending-swap manifest schema.
 - Specify the simple-wrapper detection heuristic concretely (what counts as "one
   API call + trivial marshalling") and the classifier prompt/checklist.
-- Decide the shadow-worktree + build invocation mechanics and the green/red parse.
-- Design the gated-swap launcher (SessionStart hook vs `.bat` wrapper) and the
-  binary/source apply step.
+- Decide the in-place build invocation (`Build.bat <Project>Editor Win64 <Config>`)
+  and the `Result: Succeeded` parse; the rollback (`git checkout` + rebuild) path.
+- Design the session-start launcher (SessionStart hook vs `.bat` wrapper) that runs
+  the build gate with the editor closed and launches on green.
 - Extend the gap-log format for auto-cycle outcomes.
 - Update `vibeue-self-improve` skill phases (DETECT…LOG) to add CLASSIFY, QUEUE,
-  GENERATE(shadow), and SWAP, and to encode the simple-wrapper-only v1 limit.
+  GENERATE, and BUILD, and to encode the simple-wrapper-only v1 limit.
 - Update project memory to record the §8 carve-out.
 - Dry-run end-to-end on one synthetic simple-wrapper candidate.
