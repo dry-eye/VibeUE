@@ -42,3 +42,15 @@ Append-only. Format defined in `README.md`.
 - **Commit:** 0000000
 
 ---
+
+## GAP-20260606-1: author a Control Rig (FK + IK) for a skeletal mesh from Python
+- **Date:** 2026-06-06
+- **Intent:** Build an animator Control Rig (`ControlRigBlueprint`) for `SKM_KimodoSOMA` (77-bone humanoid) — FK on all bones + Two-Bone IK arms/legs with pole vectors + FK/IK switch + a master control hierarchy — to animate the character in Sequencer.
+- **Searched:** manage_skills(list) — no control-rig skill (skeleton/animation-* only, none author a CR graph); discover_python_class(RigVMController / RigHierarchyController) — primitives exist (`add_unit_node`, `add_control`, `import_bones_from_skeletal_mesh`) but no high-level "generate biped rig"; reference `CR_UEFNMannyTatoolsRig` is a tool-generated content asset, the ThreepeatAnimTools C++ has no generator.
+- **Why no tool:** No stock API generates a control rig; assembling one from RigVM primitives via raw `execute_python_code` is multi-step and full of crash/corruption traps (PerItem IK node access-violation, un-deletable CR assets, corrupt-CR editor-brick on load, control-offset stacking, value-contaminated global reads). Worth a verified, gotcha-laden skill doc.
+- **Tier:** skill
+- **Artifact:** Content/Skills/control-rig/SKILL.md (new)
+- **Verified:** Live in UE 5.7 editor. Built `/KimodoTextToAnim/CR_KimodoSOMARig`: 76 controls, 139-node graph (BeginExecution → 61 FK Get/SetTransform pairs → 4 TwoBoneIKSimple). After `load_asset` reload: ALL 61 FK controls + 4 IK effectors verify on-bone (delta < 0.5); master controls global@z0 / root@z0 / body@z99.9; `compile_blueprint` clean; full execute chain confirmed. Offset recipe (`control offset = bone LOCAL transform`, fresh controls, parent-first) proven reload-stable on a 7-deep chain in an isolated test rig.
+- **Commit:** e0110e9
+
+---
