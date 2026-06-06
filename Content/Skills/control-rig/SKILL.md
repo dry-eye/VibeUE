@@ -158,4 +158,27 @@ Mirror production rigs (e.g. Tatools): `global_ctrl → root_ctrl → body_ctrl 
 
 ## Verify
 
-`unreal.BlueprintEditorLibrary.compile_blueprint(bp)` then `unreal.EditorAssetLibrary.save_asset(path, True)`. Compile success + all controls-on-bones (after reload) + a fully chained execute path (BeginExecution → every SetT → every IK) is the static gate. Visual FK/IK behaviour (limb pop, axis sign) is confirmed by the user in the Control Rig editor / Sequencer.
+`unreal.BlueprintEditorLibrary.compile_blueprint(bp)` then `unreal.EditorAssetLibrary.save_asset(path, True)`. Compile success + all controls-on-bones (after reload) + a fully chained execute path (BeginExecution → every SetT → every IK) is the static gate.
+
+### Runtime verification (safe — executing a compiled rig does NOT crash)
+
+Unlike *authoring* nodes (which can crash a poisoned interpreter), *executing* a clean compiled rig is safe. Instantiate it, drive a control, run the solve, read the bone — definitive proof:
+
+```python
+cr = bp.create_control_rig()
+cr.request_init()
+hier = cr.get_hierarchy()                       # the instance's own DynamicHierarchy
+cr.execute("Construction Event")
+cr.execute("Forwards Solve")                     # baseline pose
+base = hier.get_global_transform(bk("Hips")).translation
+
+# move a control on the INSTANCE hierarchy, re-solve, read the driven bone
+et = unreal.EulerTransform(); et.location = unreal.Vector(0,0,50)
+hier.set_control_value(ck("body_ctrl"),
+    unreal.RigHierarchy.make_control_value_from_euler_transform(et),
+    unreal.RigControlValueType.CURRENT)
+cr.execute("Forwards Solve")
+moved = hier.get_global_transform(bk("Hips")).translation   # Hips.z should be base.z + 50
+```
+
+Float switches: `make_control_value_from_float(1.0)`. To prove FK/IK blend: with the switch at 0, moving the IK effector control must NOT move the bone; at 1, it must. (Verified on `CR_KimodoSOMARig`: `body_ctrl +Z50` → Hips & Head both Δ+50; `arm_l_fkik` 0→1 with a raised `hand_l_ik_ctrl` → LeftHand Δz 0 → +27.9.)
